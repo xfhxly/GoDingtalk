@@ -7,11 +7,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
 
-// 全局HTTP客户端，复用连接池
+// 全局HTTP客户端，复用连接池。
+// 默认 30s 超时；main 包可通过 SetHTTPClient 注入自定义客户端
+// （例如使用 -httpTimeout 配置），使超时设置对 ts 分片下载同样生效。
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
@@ -21,52 +24,52 @@ var httpClient = &http.Client{
 	},
 }
 
-// processNum 将小于10000的数字转化为字符串(前面补0)并添加后缀
-func processNum(n int) []byte {
-	if n < 10 {
-		return []byte{48, 48, 48, byte(48 + n), '.', 't', 's'}
-	} else if n < 100 {
-		return []byte{48, 48, byte(48 + (n / 10)), byte(48 + (n % 10)), '.', 't', 's'}
-	} else if n < 1000 {
-		return []byte{48, byte(48 + (n / 100)), byte(48 + ((n / 10) % 10)), byte(48 + (n % 10)), '.', 't', 's'}
-	} else {
-		return []byte{byte(48 + (n / 1000)), byte(48 + ((n / 100) % 10)), byte(48 + ((n / 10) % 10)), byte(48 + (n % 10)), '.', 't', 's'}
+// SetHTTPClient 替换下载器使用的全局 HTTP 客户端。
+// 仅应在启动阶段、开启下载 goroutine 之前调用，避免与并发请求产生竞争。
+func SetHTTPClient(c *http.Client) {
+	if c != nil {
+		httpClient = c
 	}
 }
 
-// getAllNonDirectoryFile 获取所有非目录文件
+// processNum 将分片索引转换为带前导零的 ts 文件名（如 0000.ts）。
+// 使用 %04d：索引 <10000 时为 4 位，超出时自动扩展位数，不再有上限。
+func processNum(n int) []byte {
+	return []byte(fmt.Sprintf("%04d.ts", n))
+}
+
+// getAllNonDirectoryFile 获取所有非目录文件，并按文件名排序以保证合并顺序确定。
 func getAllNonDirectoryFile(pathName string) ([]string, error) {
 	rd, err := os.ReadDir(pathName)
 	if err != nil {
 		return nil, errorMap[ReadDirectoryException]
 	}
-	Files := make([]string, 0)
+	Files := make([]string, 0, len(rd))
 	for i := 0; i < len(rd); i++ {
 		if !rd[i].IsDir() {
-			fullName := pathName + "/" + rd[i].Name()
-			Files = append(Files, fullName)
+			Files = append(Files, path.Join(pathName, rd[i].Name()))
 		}
 	}
-	rd = nil
+	sort.Strings(Files)
 	return Files, nil
 }
 
-// httpGet 发起get请求
-func httpGet(url string) (io.ReadCloser, DownloadExceptionType) {
+// httpGet 发起 GET 请求，返回响应体、异常类型以及具体错误。
+// 不再写入全局 errorMap —— 多个下载 goroutine 并发调用时同时写 map 会触发
+// concurrent map writes panic，因此错误详情通过返回值传出，由调用方按需记录。
+func httpGet(url string) (io.ReadCloser, DownloadExceptionType, error) {
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		if err.Error()[len(err.Error())-12:] == "no such host" {
-			return nil, NetworkException
-		} else {
-			errorMap[UnexpectedException] = err
+		if strings.HasSuffix(err.Error(), "no such host") {
+			return nil, NetworkException, err
 		}
-		return nil, UnexpectedException
+		return nil, UnexpectedException, err
 	}
-	if resp.StatusCode != 200 {
-		errorMap[HttpException] = fmt.Errorf("[HttpError]:status code %d", resp.StatusCode)
-		return nil, HttpException
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, HttpException, fmt.Errorf("[HttpError]: status code %d", resp.StatusCode)
 	}
-	return resp.Body, NoException
+	return resp.Body, NoException, nil
 }
 
 // mergeFile 合并文件主函数
@@ -108,7 +111,7 @@ func mergeFile(path string, fileList []string, saveName string) error {
 	return nil
 }
 
-// getUnixTimeAndToByte 根据加当前时间戳设置为默认名称
+// getUnixTimeAndToByte 根据当前时间戳生成默认名称
 func getUnixTimeAndToByte() string {
 	// 直接使用标准库的转换函数
 	return fmt.Sprintf("%d", time.Now().Unix())
@@ -129,7 +132,7 @@ func ResolveURL(u *url.URL, p string) string {
 	return baseURL + path.Join("/", p)
 }
 
-// PathExists 判断目录是否存在，若不存在则创建
+// PathExists 判断路径是否存在
 func PathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
@@ -141,21 +144,8 @@ func PathExists(path string) (bool, error) {
 	return false, err
 }
 
-// CheckAndCreatDirectory 判断目录是否存在，若不存在则创建
+// CheckAndCreatDirectory 判断目录是否存在，若不存在则创建（含必要的父目录）。
+// 使用 MkdirAll，支持嵌套保存目录（如 downloads/video/）。
 func CheckAndCreatDirectory(path string) error {
-	_, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			//说明文件夹不存在
-			err = os.Mkdir(path, os.ModePerm)
-			if err != nil {
-				return err
-			}
-			return nil
-		} else {
-			//说明出现了错误，不能确定文件夹是否存在
-			return err
-		}
-	}
-	return nil
+	return os.MkdirAll(path, 0755)
 }

@@ -78,22 +78,6 @@ func TestSetIfShowTheBar(t *testing.T) {
 	}
 }
 
-func TestSetDownloadModel(t *testing.T) {
-	downloader := NewDownloader().(*m3u8downloader)
-
-	// 测试有效的下载模式
-	downloader.SetDownloadModel(SaveAsTsFileAndMergeModel)
-	if downloader.config.DownloadModel != SaveAsTsFileAndMergeModel {
-		t.Errorf("SetDownloadModel(SaveAsTsFileAndMergeModel) failed")
-	}
-
-	// 测试无效的下载模式，应该回退到默认模式
-	downloader.SetDownloadModel(999)
-	if downloader.config.DownloadModel != SaveAsTsFileAndMergeModel {
-		t.Errorf("SetDownloadModel(invalid) should default to SaveAsTsFileAndMergeModel")
-	}
-}
-
 func TestNewDownloader(t *testing.T) {
 	downloader := NewDownloader()
 
@@ -113,10 +97,6 @@ func TestNewDownloader(t *testing.T) {
 
 	if md.config.SaveDirectory != defaultSaveDirectory {
 		t.Errorf("Default SaveDirectory = %s, want %s", md.config.SaveDirectory, defaultSaveDirectory)
-	}
-
-	if md.config.DownloadModel != SaveAsTsFileAndMergeModel {
-		t.Errorf("Default DownloadModel = %d, want %d", md.config.DownloadModel, SaveAsTsFileAndMergeModel)
 	}
 }
 

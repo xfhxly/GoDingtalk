@@ -11,19 +11,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
 	CryptMethodAES        CryptMethod = "AES-128"
 	CryptMethodNONE       CryptMethod = "NONE"
 	defaultNumberOfThread             = 10
-	//WriteIntoCacheAndSaveModel 使用缓存下载模式的处理器函数,暂时废弃，因为会占用大量内存，且视频质量不高
-	WriteIntoCacheAndSaveModel = 1
-	SaveAsTsFileAndMergeModel  = 2
 	// SuffixTs 下载文件的后缀（TS 格式，后续通过 ffmpeg 转换为 mp4）
-	SuffixTs        = ".ts"
-	TestDownloadUrl = ""
+	SuffixTs = ".ts"
 )
 
 const (
@@ -41,20 +36,23 @@ const (
 	DecrytTSFailed
 )
 
+// errorMap 异常类型 → 默认提示文案的只读映射。
+// 注意：该 map 仅在 init 阶段写入，之后只读。
+// 运行期不再向其写入具体的错误信息（那会引发并发 map 写入 panic），
+// 具体错误通过 httpGet 的返回值沿调用链传递，记录在 m3u8downloader.lastErr。
 var (
 	defaultSaveDirectory = "./video/"
-	downloadModelMap     = map[DownloadModelType]DownloadModelType{}
 	errorMap             = map[DownloadExceptionType]error{}
 )
 
-// init 初始化函数
+// init 初始化异常默认文案
 func init() {
-	downloadModelMap[WriteIntoCacheAndSaveModel] = WriteIntoCacheAndSaveModel
-	downloadModelMap[SaveAsTsFileAndMergeModel] = SaveAsTsFileAndMergeModel
 	errorMap[UrlException] = errors.New("[URLException]: Invalid URL format, please check your URL")
 	errorMap[IOException] = errors.New("[IOException]: Failed to read or write file")
 	errorMap[ReadDirectoryException] = errors.New("[ReadDirectoryException]: Failed to read directory")
 	errorMap[NetworkException] = errors.New("[NetworkException]: Network connection failed")
+	errorMap[UnexpectedException] = errors.New("[UnexpectedException]: Unexpected error during HTTP request")
+	errorMap[HttpException] = errors.New("[HttpException]: HTTP request returned non-200 status")
 	errorMap[InvalidM3u8Exception] = errors.New("[InvalidM3u8Exception]: Invalid M3U8 file format")
 	errorMap[InvalidEXT_X_KEY] = errors.New("[InvalidEXT_X_KEY]: Invalid encryption key in M3U8 file")
 	errorMap[InvalidEXT_X_KEYMethod] = errors.New("[InvalidEXT_X_KEYMethod]: Unsupported encryption method")
@@ -64,10 +62,10 @@ func init() {
 
 // 自定义类型
 type (
-	IntChannel            chan int
+	IntChannel chan int
+	// downloadCallback 单个分片下载完成后的处理回调（写盘）
+	downloadCallback      func(index, threadId int, body []byte)
 	DownloadExceptionType int
-	DownloadModelType     int
-	DownloadModelFunction func(int, int, []byte)
 )
 
 // M3u8Downloader 下载器接口对象
@@ -88,8 +86,6 @@ type M3u8Downloader interface {
 	SetMovieName(videoName string)
 	// SetSaveDirectory 设置保存目录
 	SetSaveDirectory(targetDir string)
-	// SetDownloadModel 设置下载模式
-	SetDownloadModel(model DownloadModelType)
 	// MergeFile 默认合并文件
 	MergeFile() error
 	// MergeFileInDir 将合并后的视频文件保存到目录dir中
@@ -108,11 +104,10 @@ type m3u8downloader struct {
 	waitGroup *sync.WaitGroup
 	// buffer 用于构造一些字符串所需要使用的缓冲区
 	buffer []strings.Builder
-	// cacheMap 在使用“按顺序写入”下载模式时承载缓存信息
-	//建对应着视频的索引，值对应的暂时缓存在内存中等待写入的请求结果对象的[]byte信息
-	cacheMap map[int][]byte
-	//exception 下载中的异常
+	//exception 下载中的异常类型（并发访问，统一经 config.errMutex 保护）
 	exception DownloadExceptionType
+	// lastErr 最近一次异常的具体错误信息，配合 exception 一起返回给调用方
+	lastErr error
 	// m3u8ParseResult 对于m3u8解析的结果
 	m3u8ParseResult *Result
 	// successChan
@@ -137,14 +132,12 @@ type DownloadConfig struct {
 	ifShowBar bool
 	// errCount 下载出错的数量
 	errCount int
-	// errMutex 保护errCount的互斥锁
+	// errMutex 保护 errCount / exception / lastErr 的互斥锁
 	errMutex sync.Mutex
 	// completeCount 下载完成的数量（使用原子操作保证线程安全）
 	completeCount int64
 	// TotalNum 总共的下载数量
 	TotalNum int
-	// DownloadModel 设置下载模式
-	DownloadModel DownloadModelType
 }
 
 // M3u8 解析m3u8文件后的内容的集合
@@ -181,7 +174,6 @@ func NewDownloader() M3u8Downloader {
 		ifShowBar:     false,
 		SaveDirectory: defaultSaveDirectory,
 		Url:           nil,
-		DownloadModel: SaveAsTsFileAndMergeModel,
 	})
 }
 
@@ -195,8 +187,6 @@ func defaultConstructor(config *DownloadConfig) M3u8Downloader {
 	return &m3u8downloader{
 		config:      config,
 		buffer:      make([]strings.Builder, defaultNumberOfThread),
-		cacheMap:    nil,
-		suffixList:  nil,
 		exception:   NoException,
 		waitGroup:   &sync.WaitGroup{},
 		taskChannel: nil,
@@ -204,25 +194,34 @@ func defaultConstructor(config *DownloadConfig) M3u8Downloader {
 	}
 }
 
+// markException 线程安全地记录异常类型与具体错误。
+// 下载过程存在多个 goroutine 并发，exception / lastErr 的读写必须经 errMutex 保护。
+func (md *m3u8downloader) markException(exc DownloadExceptionType, err error) {
+	md.config.errMutex.Lock()
+	defer md.config.errMutex.Unlock()
+	md.exception = exc
+	if err != nil {
+		md.lastErr = err
+	}
+}
+
 // httpGetBodyToByte 以byte数组的形式返回请求体的内容
 func (md *m3u8downloader) httpGetBodyToByte(url string) []byte {
-	res, exception := httpGet(url)
+	res, exception, err := httpGet(url)
 	if exception != NoException {
-		//对异常进行标识，其他线程将会识别到
-		md.exception = exception
+		md.markException(exception, err)
 		return nil
 	}
 	defer res.Close()
 	body, err := io.ReadAll(res)
 	if err != nil {
-		md.exception = IOException
+		md.markException(IOException, err)
 		return nil
 	}
 	return body
 }
 
 func (md *m3u8downloader) DefaultDownload() bool {
-	md.config.DownloadModel = SaveAsTsFileAndMergeModel
 	err := md.Download()
 	if err != nil {
 		fmt.Println(err.Error())
@@ -277,15 +276,6 @@ func (md *m3u8downloader) SetSaveDirectory(targetDir string) {
 	md.config.SaveDirectory = temp
 }
 
-// SetDownloadModel 设置下载模式
-func (md *m3u8downloader) SetDownloadModel(model DownloadModelType) {
-	var ok bool
-	md.config.DownloadModel, ok = downloadModelMap[model]
-	if !ok {
-		md.config.DownloadModel = SaveAsTsFileAndMergeModel
-	}
-}
-
 // showTheBar 显示进度条方法
 func (md *m3u8downloader) showTheBar() {
 	md.printInfo()
@@ -301,7 +291,6 @@ func (md *m3u8downloader) showTheBar() {
 			break
 		}
 		bar.Update(int64(num))
-		//time.Sleep(300*time.Millisecond)
 	}
 	bar.Finish()
 
@@ -334,7 +323,7 @@ func (md *m3u8downloader) Download() error {
 	// 首先解析url
 	md.m3u8ParseResult, err = md.ParseM3u8FileEncrypted(string(md.config.Url))
 	if err != nil {
-		return errorMap[UrlException]
+		return fmt.Errorf("解析 m3u8 失败: %w", err)
 	}
 	if md.config.VideoName == "" {
 		//如果没有设置name,使用时间戳来代替
@@ -344,23 +333,17 @@ func (md *m3u8downloader) Download() error {
 	md.successChan = make(IntChannel, md.config.NumOfThreads)
 	md.config.errCount = 0
 	md.config.completeCount = 0
+	md.exception = NoException
+	md.lastErr = nil
 	md.config.TotalNum = len(md.m3u8ParseResult.M3u8.Segments)
 	md.suffixList = make([]string, md.config.TotalNum)
 	md.waitGroup.Add(md.config.NumOfThreads)
-	//选择下载模式
-	var callBackFunc DownloadModelFunction
-	if md.config.DownloadModel == WriteIntoCacheAndSaveModel {
-		go md.WriteIntoCacheAndSaveProcessor()
-		callBackFunc = md.WriteIntoCacheAndSave
-	} else {
-		callBackFunc = md.SaveAsTsFileAndMergeEncryption
-	}
 	md.taskChannel = make(IntChannel, 50)
 	//发布下载任务
 	go md.publishDownloadTask()
-	//开启下载线程
+	//开启下载线程（单一模式：下载为 ts 文件后合并）
 	for i := 0; i < md.config.NumOfThreads; i++ {
-		go md.download(i, callBackFunc)
+		go md.download(i, md.SaveAsTsFileAndMergeEncryption)
 	}
 	//显示进度条
 	if md.config.ifShowBar {
@@ -368,16 +351,28 @@ func (md *m3u8downloader) Download() error {
 	}
 	//阻塞等待
 	md.waitGroup.Wait()
-	//检查异常
-	if md.exception != NoException {
-		return errorMap[md.exception]
-	}
+	// 无论成功失败都关闭 successChan，避免进度条 goroutine 泄漏
 	close(md.successChan)
+
+	// 仅当错误累计达到致命阈值时判定为失败；
+	// 普通的可重试错误若最终重试成功（errCount 未达阈值）则视为成功。
+	md.config.errMutex.Lock()
+	exc := md.exception
+	lastErr := md.lastErr
+	reachedFatal := md.config.errCount >= 2*md.config.NumOfThreads
+	md.config.errMutex.Unlock()
+
+	if reachedFatal {
+		if lastErr != nil {
+			return fmt.Errorf("%w: %v", errorMap[exc], lastErr)
+		}
+		return errorMap[exc]
+	}
 	return nil
 }
 
 // download 执行任务的主逻辑
-func (md *m3u8downloader) download(threadId int, downloadModel func(int, int, []byte)) {
+func (md *m3u8downloader) download(threadId int, handle downloadCallback) {
 	var index int
 	var ok bool
 	var body []byte
@@ -387,46 +382,40 @@ func (md *m3u8downloader) download(threadId int, downloadModel func(int, int, []
 		index, ok = <-md.taskChannel
 		if !ok {
 			break
-		} //拼接路径
+		}
+		//拼接路径
 		segments = md.m3u8ParseResult.M3u8.Segments[index]
 		fullURL := ResolveURL(md.m3u8ParseResult.URL, segments.URI)
-		//尝试下载，错误达到一定次数停止下载
+		//尝试下载，以 body 是否为空判断成功，错误累计达到阈值后停止
 		for {
 			body = md.httpGetBodyToByte(fullURL)
-			// 使用互斥锁保护errCount的读写
+			if body != nil {
+				break
+			}
 			md.config.errMutex.Lock()
-			currentErrCount := md.config.errCount
-			md.config.errMutex.Unlock()
-
-			if currentErrCount < 2*md.config.NumOfThreads {
-				if md.exception == NoException {
-					break
-				}
-				//如果出现范围允许的错误，则重试
-				md.config.errMutex.Lock()
-				md.config.errCount++
+			if md.config.errCount >= 2*md.config.NumOfThreads {
 				md.config.errMutex.Unlock()
-				md.exception = NoException
-			} else {
-				//若出现严重错误，则通知其他线程，停止工作
 				md.waitGroup.Done()
 				return
 			}
+			md.config.errCount++
+			md.config.errMutex.Unlock()
 		}
 		// 解密 TS 数据
 		if segments.Key != nil {
-			var err error
 			key := md.m3u8ParseResult.Keys[segments.Key]
 			if key != "" {
+				var err error
 				body, err = AES128Decrypt(body, []byte(key), []byte(segments.Key.IV))
 				if err != nil {
-					md.exception = DecrytTSFailed //放置异常类型
+					// 解密失败属于不可重试的严重错误，立即停止所有线程
 					md.config.errMutex.Lock()
-					md.config.errCount = 2 * md.config.NumOfThreads //抛出严重异常
+					md.exception = DecrytTSFailed
+					md.lastErr = err
+					md.config.errCount = 2 * md.config.NumOfThreads
 					md.config.errMutex.Unlock()
 					md.waitGroup.Done()
 					return
-					//fmt.Printf("decryt TS failed: %s\n", err.Error())
 				}
 			}
 		}
@@ -440,7 +429,7 @@ func (md *m3u8downloader) download(threadId int, downloadModel func(int, int, []
 			}
 		}
 		//执行下载回调函数
-		downloadModel(index, threadId, body)
+		handle(index, threadId, body)
 	}
 	md.waitGroup.Done()
 }
@@ -453,9 +442,10 @@ func (md *m3u8downloader) SaveAsTsFileAndMergeEncryption(index, threadId int, bo
 	movie, err := os.OpenFile(md.suffixList[index], os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		md.config.errMutex.Lock()
+		md.exception = IOException
+		md.lastErr = err
 		md.config.errCount += md.config.NumOfThreads
 		md.config.errMutex.Unlock()
-		md.exception = IOException
 		return
 	}
 	movie.Write(body)
@@ -463,7 +453,6 @@ func (md *m3u8downloader) SaveAsTsFileAndMergeEncryption(index, threadId int, bo
 	md.buffer[threadId].Reset()
 	count := atomic.AddInt64(&md.config.completeCount, 1)
 	md.successChan <- int(count)
-	//fmt.Println(md.config.completeCount)
 	body = nil
 }
 
@@ -475,65 +464,13 @@ func (md *m3u8downloader) publishDownloadTask() {
 	close(md.taskChannel)
 }
 
-// WriteIntoCacheAndSaveProcessor 使用缓存下载模式的处理器函数,暂时废弃，因为会占用大量内存，且视频质量不高
-func (md *m3u8downloader) WriteIntoCacheAndSaveProcessor() {
-	var buffer strings.Builder
-	buffer.WriteString(md.config.SaveDirectory)
-	buffer.WriteString(md.config.VideoName)
-	movie, err := os.OpenFile(buffer.String(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.ModePerm)
-	if err != nil {
-		md.config.errMutex.Lock()
-		md.config.errCount += md.config.NumOfThreads
-		md.config.errMutex.Unlock()
-		md.exception = IOException
-		return
-	}
-	defer movie.Close()
-	md.cacheMap = map[int][]byte{}
-	var body []byte
-	var i int
-	var ok bool
-	//自旋
-	for i < md.config.TotalNum {
-		//如果字典中有了对应索引的id相关的内容，则追加写入然后继续新的尝试，
-		//否则睡眠等待一定时间后再次尝试，以减少资源的消耗，直到成功为止
-		if body, ok = md.cacheMap[i]; ok {
-			movie.Write(body)
-			md.cacheMap[i] = nil
-			delete(md.cacheMap, i)
-
-			i++
-		} else {
-			time.Sleep(250 * time.Millisecond)
-		}
-	}
-	//ReSet The Map And Help GC
-	md.cacheMap = nil
-}
-
-// WriteIntoCacheAndSave 写入缓存，最后保存
-func (md *m3u8downloader) WriteIntoCacheAndSave(index, threadId int, body []byte) {
-	md.cacheMap[index] = body
-	md.buffer[threadId].Reset()
-	count := atomic.AddInt64(&md.config.completeCount, 1)
-	md.successChan <- int(count)
-}
-
 // MergeFileInDir 将目标目录下的ts文件全部合并
 func (md *m3u8downloader) MergeFileInDir(path string, saveName string) error {
-	var (
-		fileList []string
-		err      error
-	)
-	fileList, err = getAllNonDirectoryFile(path)
-	if err != nil {
-		return err // 修复：正确返回错误而不是 nil
-	}
-	err = mergeFile(path, fileList, saveName)
+	fileList, err := getAllNonDirectoryFile(path)
 	if err != nil {
 		return err
 	}
-	return nil
+	return mergeFile(path, fileList, saveName)
 }
 
 // MergeFile 在下载完毕后文件合并
@@ -541,33 +478,7 @@ func (md *m3u8downloader) MergeFile() error {
 	if md.suffixList == nil {
 		return nil
 	}
-	err := mergeFile(md.config.SaveDirectory, md.suffixList, md.config.VideoName)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// parseM3u8FileUnencrypted 解析并处理未加密的m3u8文件
-func (md *m3u8downloader) parseM3u8FileUnencrypted(url string) {
-	body := md.httpGetBodyToByte(url)
-	if md.exception != NoException {
-		return
-	}
-	var temp []byte
-	var i, left, bodyLen = 0, 0, len(body) - 1
-	for i < bodyLen {
-		if body[i] == '/' || body[i] == '\n' {
-			i += 1
-			left = i
-		} else if body[i] == '.' && body[i+1] == 't' {
-			i += 3
-			temp = body[left:i]
-			md.suffixList = append(md.suffixList, string(temp))
-		} else {
-			i++
-		}
-	}
+	return mergeFile(md.config.SaveDirectory, md.suffixList, md.config.VideoName)
 }
 
 // ParseM3u8FileEncrypted 解析并处理加密的m3u8文件
@@ -583,9 +494,9 @@ func (md *m3u8downloader) ParseM3u8FileEncrypted(link string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, exception = httpGet(_url.String())
+	body, exception, err = httpGet(_url.String())
 	if exception != NoException {
-		return nil, errorMap[exception]
+		return nil, fmt.Errorf("%w: %v", errorMap[exception], err)
 	}
 	//noinspection GoUnhandledErrorResult
 	defer body.Close()
@@ -626,6 +537,9 @@ func (md *m3u8downloader) ParseM3u8FileEncrypted(link string) (*Result, error) {
 
 			keyByte = md.httpGetBodyToByte(ResolveURL(_url, seg.Key.URI))
 			if keyByte == nil {
+				if md.lastErr != nil {
+					return nil, fmt.Errorf("%w: %v", errorMap[md.exception], md.lastErr)
+				}
 				return nil, errorMap[md.exception]
 			}
 			result.Keys[seg.Key] = string(keyByte)
