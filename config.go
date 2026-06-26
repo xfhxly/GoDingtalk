@@ -30,12 +30,12 @@ func getConfigDir() (string, error) {
 	}
 	exeDir := filepath.Dir(exePath)
 	configDir := filepath.Join(exeDir, ".goDingtalkConfig")
-	
+
 	// 创建配置文件夹（如果不存在）
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return "", err
 	}
-	
+
 	return configDir, nil
 }
 
@@ -46,7 +46,7 @@ func DefaultConfig() *Config {
 		// 如果获取配置文件夹失败，使用当前目录
 		configDir = "."
 	}
-	
+
 	return &Config{
 		ThreadCount:   10,
 		SaveDirectory: "video/",

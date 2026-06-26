@@ -101,15 +101,15 @@ func normalizePathForRuntime(path string) string {
 	return normalizePathForTarget(path, runtime.GOOS, isWSLEnvironment())
 }
 
+// sanitizeInvalidChars 匹配文件名中的非法字符（/ \ : * ? " < > |）。
+// 预编译为包级变量全局复用，避免每次调用 sanitizeFileName 都重新编译正则。
+var sanitizeInvalidChars = regexp.MustCompile(`[\\/:*?"<>|]`)
+
 // sanitizeFileName 清理文件名中的非法字符，替换为下划线
 func sanitizeFileName(fileName string) string {
-	// 定义非法字符的正则表达式
 	// 经过测试，只有以下字符会影响文件路径创建：/ \ : * ? " < > |
 	// 空格和反引号不会影响，所以不需要清理
-	reg := regexp.MustCompile(`[\\/:*?"<>|]`)
-
-	// 将非法字符替换为下划线
-	sanitized := reg.ReplaceAllString(fileName, "_")
+	sanitized := sanitizeInvalidChars.ReplaceAllString(fileName, "_")
 
 	// 如果清理后为空字符串，使用默认名称
 	if sanitized == "" {
@@ -121,6 +121,9 @@ func sanitizeFileName(fileName string) string {
 
 // Version 程序版本号，通过 -ldflags "-X main.Version=vX.X.X" 注入
 var Version = "dev"
+
+// dingtalkUserAgent 请求钉钉接口使用的 User-Agent
+const dingtalkUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 // 全局HTTP客户端，在 main 中根据配置初始化
 var httpClient *http.Client
@@ -166,6 +169,34 @@ func ffmpeg(ts, tempDir, saveDir string) error {
 	return nil
 }
 
+// dingtalkHeaders 构造请求钉钉回放接口所需的请求头
+func dingtalkHeaders(cookie string) http.Header {
+	h := http.Header{}
+	h.Set("Host", "lv.dingtalk.com")
+	h.Set("Cookie", cookie)
+	h.Set("Sec-Ch-Ua", `"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"`)
+	h.Set("Sec-Ch-Ua-Mobile", "?0")
+	h.Set("Sec-Ch-Ua-Platform", "macOS")
+	h.Set("Dnt", "1")
+	h.Set("Upgrade-Insecure-Requests", "1")
+	h.Set("User-Agent", dingtalkUserAgent)
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	h.Set("Sec-Fetch-Site", "none")
+	h.Set("Sec-Fetch-Mode", "navigate")
+	h.Set("Sec-Fetch-User", "?1")
+	h.Set("Sec-Fetch-Dest", "document")
+	h.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	return h
+}
+
+// checkFFmpegAvailable 检查 ffmpeg 是否已安装并可在 PATH 中调用
+func checkFFmpegAvailable() error {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("未找到 ffmpeg，请先安装 FFmpeg 并确保其在 PATH 中（用于视频格式转换）")
+	}
+	return nil
+}
+
 // generateUniqueTempDir 生成唯一的临时目录名称
 func generateUniqueTempDir(saveDir string) (string, error) {
 	pattern := fmt.Sprintf(".videoTemp%s_*", time.Now().Format("20060102"))
@@ -188,9 +219,10 @@ func cleanupTempDir(tempDir string) {
 func startChrome(config *Config) error {
 	fmt.Println("正在启动Chrome获取Cookies...")
 
-	// 抑制 chromedp 的日志输出
+	// 抑制 chromedp 的日志输出（保存当前输出目标，结束时恢复，避免污染全局 log 状态）
+	prevLogOut := log.Writer()
 	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
+	defer log.SetOutput(prevLogOut)
 
 	opts := append(
 		// 跳过前3个选项以禁用 headless 模式，让浏览器可见
@@ -362,21 +394,8 @@ func getLiveRoomPublicInfo(roomId, liveUuid, saveDir string, Thread int, config 
 	cookieStr.WriteString(fmt.Sprintf("PC_SESSION=%s", CookiepcSession))
 	cookieHeader := cookieStr.String()
 
-	// 设置请求头
-	req.Header.Set("Host", "lv.dingtalk.com")
-	req.Header.Set("Cookie", cookieHeader)
-	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", "macOS")
-	req.Header.Set("Dnt", "1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	// 设置请求头（集中维护，便于钉钉接口变更时统一调整）
+	req.Header = dingtalkHeaders(cookieHeader)
 
 	// 发送请求（使用全局 HTTP 客户端）
 	resp, err := httpClient.Do(req)
@@ -704,8 +723,10 @@ func main() {
 		*saveDir = normalizedSaveDir
 	}
 
-	// 初始化全局 HTTP 客户端
+	// 初始化全局 HTTP 客户端，并注入到下载器子包，
+	// 使 -httpTimeout 配置对实际的 ts 分片下载同样生效
 	initHTTPClient(config.HTTPTimeout)
+	M3u8Downloader.SetHTTPClient(httpClient)
 
 	// 参数验证
 	if *urlFlag == "" && *urlFile == "" && !*loginFlag {
@@ -741,6 +762,12 @@ func main() {
 	if *urlFlag == "" && *urlFile == "" {
 		fmt.Println("\n登录完成！")
 		os.Exit(0)
+	}
+
+	// 下载流程依赖 ffmpeg 做格式转换，提前检查是否可用
+	if err := checkFFmpegAvailable(); err != nil {
+		fmt.Printf("错误: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 创建视频列表文件（在下载前创建）

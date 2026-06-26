@@ -32,15 +32,14 @@ func (f *fakeDownloader) DefaultDownload() bool { return f.defaultDownload }
 func (f *fakeDownloader) ParseM3u8FileEncrypted(link string) (*M3u8Downloader.Result, error) {
 	return nil, nil
 }
-func (f *fakeDownloader) Download() error                                         { return nil }
-func (f *fakeDownloader) SetUrl(url string)                                       { f.url = url }
-func (f *fakeDownloader) SetIfShowTheBar(ifShow bool)                             { f.showBar = ifShow }
-func (f *fakeDownloader) SetNumOfThread(num int)                                  { f.threadNum = num }
-func (f *fakeDownloader) SetMovieName(videoName string)                           { f.movieName = videoName }
-func (f *fakeDownloader) SetSaveDirectory(targetDir string)                       { f.saveDir = targetDir }
-func (f *fakeDownloader) SetDownloadModel(model M3u8Downloader.DownloadModelType) {}
-func (f *fakeDownloader) MergeFile() error                                        { return nil }
-func (f *fakeDownloader) MergeFileInDir(path string, saveName string) error       { return nil }
+func (f *fakeDownloader) Download() error                                   { return nil }
+func (f *fakeDownloader) SetUrl(url string)                                 { f.url = url }
+func (f *fakeDownloader) SetIfShowTheBar(ifShow bool)                       { f.showBar = ifShow }
+func (f *fakeDownloader) SetNumOfThread(num int)                            { f.threadNum = num }
+func (f *fakeDownloader) SetMovieName(videoName string)                     { f.movieName = videoName }
+func (f *fakeDownloader) SetSaveDirectory(targetDir string)                 { f.saveDir = targetDir }
+func (f *fakeDownloader) MergeFile() error                                  { return nil }
+func (f *fakeDownloader) MergeFileInDir(path string, saveName string) error { return nil }
 
 func jsonHTTPResponse(body string) *http.Response {
 	return &http.Response{
