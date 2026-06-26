@@ -4,7 +4,7 @@
 
 ## 前提条件
 
-- **FFmpeg** (用于视频格式转换)
+- **FFmpeg** (用于视频格式转换，程序在下载前会自动检查是否可用)
 - **Google Chrome** (用于自动登录获取 Cookies)
 
 ## 安装
@@ -68,7 +68,7 @@ go build -o GoDingtalk .
 | `-config` | 配置文件路径 | |
 | `-login` | 强制重新登录获取 Cookies | |
 | `-cookies` | Cookies 文件路径 | |
-| `-httpTimeout` | HTTP 超时时间（秒） | 30 |
+| `-httpTimeout` | HTTP 超时时间（秒，作用于全部请求含分片下载） | 30 |
 | `-chromeTimeout` | Chrome 登录超时时间（分钟） | 20 |
 | `-chromePath` | Chrome/Chromium 可执行文件路径 | 自动查找 |
 | `-version` | 显示版本号 | |

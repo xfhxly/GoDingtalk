@@ -40,3 +40,9 @@ downloads/
 
 # 临时文件
 *.tmp
+
+# Claude Code 工作目录
+.claude/
+
+# 测试运行时 LoadConfig 自动生成的临时配置文件
+non_existent_config.json
