@@ -133,6 +133,7 @@ var (
 	ffmpegFunc     = ffmpeg
 	tempDirFactory = generateUniqueTempDir
 	tempDirCleanup = cleanupTempDir
+	executablePath = os.Executable
 )
 
 // initHTTPClient 初始化全局HTTP客户端
@@ -147,6 +148,34 @@ func initHTTPClient(timeout int) {
 	}
 }
 
+// findFFmpeg 定位 ffmpeg 可执行文件，返回可直接用于 exec.Command 的完整路径。
+// 查找顺序：
+//  1. PATH（仅当 LookPath 无错误时才算找到；Go 1.19+ 在 Windows 上通过当前目录
+//     隐式解析时会返回 exec.ErrDot，这种情况不能直接使用）
+//  2. 程序自身所在目录（Windows 用户常把 ffmpeg.exe 放在程序旁边）
+func findFFmpeg() (string, error) {
+	if path, err := exec.LookPath("ffmpeg"); err == nil {
+		return path, nil
+	}
+
+	exePath, err := executablePath()
+	if err != nil {
+		return "", fmt.Errorf("无法定位程序所在目录: %w", err)
+	}
+	names := []string{"ffmpeg"}
+	if runtime.GOOS == "windows" {
+		names = []string{"ffmpeg.exe", "ffmpeg"}
+	}
+	for _, name := range names {
+		path := filepath.Join(filepath.Dir(exePath), name)
+		if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("未找到 ffmpeg，请安装 FFmpeg 并加入 PATH，或将 ffmpeg 可执行文件放到程序所在目录（用于视频格式转换）")
+}
+
 // ffmpeg 把ts转换mp4
 func ffmpeg(ts, tempDir, saveDir string) error {
 	fmt.Println("正在转换ts为mp4...")
@@ -156,7 +185,11 @@ func ffmpeg(ts, tempDir, saveDir string) error {
 	tsPath := filepath.Join(tempDir, sanitizedTs+".ts")
 	mp4Path := filepath.Join(saveDir, sanitizedTs+".mp4")
 
-	cmd := exec.Command("ffmpeg", "-i", tsPath, "-c:v", "copy", "-c:a", "copy", "-f", "mp4", "-y", mp4Path)
+	ffmpegPath, err := findFFmpeg()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(ffmpegPath, "-i", tsPath, "-c:v", "copy", "-c:a", "copy", "-f", "mp4", "-y", mp4Path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("FFmpeg转换失败: %v\n输出: %s\n", err, string(output))
@@ -189,12 +222,10 @@ func dingtalkHeaders(cookie string) http.Header {
 	return h
 }
 
-// checkFFmpegAvailable 检查 ffmpeg 是否已安装并可在 PATH 中调用
+// checkFFmpegAvailable 检查 ffmpeg 是否可用（PATH 或程序所在目录）
 func checkFFmpegAvailable() error {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return fmt.Errorf("未找到 ffmpeg，请先安装 FFmpeg 并确保其在 PATH 中（用于视频格式转换）")
-	}
-	return nil
+	_, err := findFFmpeg()
+	return err
 }
 
 // generateUniqueTempDir 生成唯一的临时目录名称

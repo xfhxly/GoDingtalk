@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -498,6 +499,52 @@ func TestFFmpegError(t *testing.T) {
 	if err := ffmpeg("video", tempDir, saveDir); err == nil {
 		t.Fatal("ffmpeg() error = nil, want non-nil")
 	}
+}
+
+func TestFindFFmpeg(t *testing.T) {
+	oldPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv("PATH", oldPath)
+	})
+
+	originalExecutablePath := executablePath
+	t.Cleanup(func() {
+		executablePath = originalExecutablePath
+	})
+
+	t.Run("found in executable dir", func(t *testing.T) {
+		exeDir := t.TempDir()
+		name := "ffmpeg"
+		if runtime.GOOS == "windows" {
+			name = "ffmpeg.exe"
+		}
+		if err := os.WriteFile(filepath.Join(exeDir, name), []byte("fake"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		executablePath = func() (string, error) { return filepath.Join(exeDir, "GoDingtalk"), nil }
+
+		path, err := findFFmpeg()
+		if err != nil {
+			t.Fatalf("findFFmpeg() error = %v, want nil", err)
+		}
+		if path != filepath.Join(exeDir, name) {
+			t.Fatalf("findFFmpeg() = %q, want %q", path, filepath.Join(exeDir, name))
+		}
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		executablePath = func() (string, error) { return filepath.Join(t.TempDir(), "GoDingtalk"), nil }
+
+		if _, err := findFFmpeg(); err == nil {
+			t.Fatal("findFFmpeg() error = nil, want non-nil")
+		}
+		if err := checkFFmpegAvailable(); err == nil {
+			t.Fatal("checkFFmpegAvailable() error = nil, want non-nil")
+		}
+	})
 }
 
 func TestM3u8Down(t *testing.T) {
