@@ -435,6 +435,11 @@ func getLiveRoomPublicInfo(roomId, liveUuid, saveDir string, Thread int, config 
 	}
 	defer resp.Body.Close()
 
+	// 检查 HTTP 状态码，避免把错误页（如 401/302 跳转）当作正常 JSON 解析
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("钉钉接口请求失败(HTTP %d)，登录可能已过期，请使用 -login 参数重新登录", resp.StatusCode)
+	}
+
 	// 读取响应内容
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -446,20 +451,25 @@ func getLiveRoomPublicInfo(roomId, liveUuid, saveDir string, Thread int, config 
 		return "", fmt.Errorf("解析响应 JSON 失败: %w", err)
 	}
 
+	// 钉钉接口在登录失效等场景下返回 {"code":"1003"} 形式的错误，优先检查
+	if code, ok := result["code"].(string); ok && code != "" && code != "0" {
+		return "", fmt.Errorf("钉钉接口返回错误(code=%s)，登录可能已过期，请使用 -login 参数重新登录", code)
+	}
+
 	// 安全地获取嵌套字段
 	openLiveDetailModel, ok := result["openLiveDetailModel"].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("响应格式错误: 未找到 openLiveDetailModel 字段")
+		return "", fmt.Errorf("响应格式错误: 未找到 openLiveDetailModel 字段（登录可能已过期，请使用 -login 参数重新登录）")
 	}
 
 	title, ok := openLiveDetailModel["title"].(string)
 	if !ok {
-		return "", fmt.Errorf("响应格式错误: 未找到 title 字段")
+		return "", fmt.Errorf("响应格式错误: 未找到 title 字段（登录可能已过期，请使用 -login 参数重新登录）")
 	}
 
 	playbackUrl, ok := openLiveDetailModel["playbackUrl"].(string)
 	if !ok {
-		return "", fmt.Errorf("响应格式错误: 未找到 playbackUrl 字段")
+		return "", fmt.Errorf("响应格式错误: 未找到 playbackUrl 字段（登录可能已过期，请使用 -login 参数重新登录）")
 	}
 
 	fmt.Println("标题:", title)

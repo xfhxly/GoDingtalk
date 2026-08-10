@@ -701,6 +701,52 @@ func TestGetLiveRoomPublicInfo(t *testing.T) {
 			t.Fatal("getLiveRoomPublicInfo() error = nil, want non-nil")
 		}
 	})
+
+	t.Run("dingtalk error code", func(t *testing.T) {
+		httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return jsonHTTPResponse(`{"code":"1003"}`), nil
+		})}
+
+		_, err := getLiveRoomPublicInfo("room", "uuid", tmpDir, 2, config)
+		if err == nil {
+			t.Fatal("getLiveRoomPublicInfo() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "-login") {
+			t.Fatalf("error = %v, want it to suggest re-login with -login", err)
+		}
+	})
+
+	t.Run("null playback url", func(t *testing.T) {
+		httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return jsonHTTPResponse(`{"openLiveDetailModel":{"title":"demo","playbackUrl":null}}`), nil
+		})}
+
+		_, err := getLiveRoomPublicInfo("room", "uuid", tmpDir, 2, config)
+		if err == nil {
+			t.Fatal("getLiveRoomPublicInfo() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "-login") {
+			t.Fatalf("error = %v, want it to suggest re-login with -login", err)
+		}
+	})
+
+	t.Run("http error status", func(t *testing.T) {
+		httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("unauthorized")),
+			}, nil
+		})}
+
+		_, err := getLiveRoomPublicInfo("room", "uuid", tmpDir, 2, config)
+		if err == nil {
+			t.Fatal("getLiveRoomPublicInfo() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "-login") {
+			t.Fatalf("error = %v, want it to suggest re-login with -login", err)
+		}
+	})
 }
 
 func TestProcessURL(t *testing.T) {
